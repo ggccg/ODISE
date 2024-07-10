@@ -29,6 +29,177 @@ from ..diffusion import GaussianDiffusion, create_gaussian_diffusion
 from ..preprocess import batched_input_to_device
 from .helper import FeatureExtractor
 
+from inspect import isfunction
+import abc
+from einops import rearrange, repeat
+from torch import nn, einsum, fft
+
+def Fourier_filter(x, threshold, scale):
+    # FFT
+    x_freq = fft.fftn(x, dim=(-2, -1))
+    x_freq = fft.fftshift(x_freq, dim=(-2, -1))
+    
+    B, C, H, W = x_freq.shape
+    mask = torch.ones((B, C, H, W)).cuda() 
+
+    crow, ccol = H // 2, W //2
+    mask[..., crow - threshold:crow + threshold, ccol - threshold:ccol + threshold] = scale
+    x_freq = x_freq * mask
+
+    # IFFT
+    x_freq = fft.ifftshift(x_freq, dim=(-2, -1))
+    x_filtered = fft.ifftn(x_freq, dim=(-2, -1)).real
+    
+    return x_filtered
+
+def exists(val):
+    return val is not None
+
+
+def uniq(arr):
+    return{el: True for el in arr}.keys()
+
+
+def default(val, d):
+    if exists(val):
+        return val
+    return d() if isfunction(d) else d
+
+def register_attention_control(model, controller):
+    def ca_forward(self, place_in_unet):
+        def forward(x, context=None, mask=None):
+            h = self.heads
+
+            q = self.to_q(x)
+            is_cross = context is not None
+            context = default(context, x)
+            k = self.to_k(context)
+            v = self.to_v(context)
+
+            q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
+
+            sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+
+            if exists(mask):
+                mask = rearrange(mask, 'b ... -> b (...)')
+                max_neg_value = -torch.finfo(sim.dtype).max
+                mask = repeat(mask, 'b j -> (b h) () j', h=h)
+                sim.masked_fill_(~mask, max_neg_value)
+
+            # attention, what we cannot get enough of
+            attn = sim.softmax(dim=-1)
+            
+            attn2 = rearrange(attn, '(b h) k c -> h b k c', h=h).mean(0)
+            controller(attn2, is_cross, place_in_unet)
+
+            out = einsum('b i j, b j d -> b i d', attn, v)
+            out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
+            return self.to_out(out)
+
+        return forward
+
+    class DummyController:
+        def __call__(self, *args):
+            return args[0]
+
+        def __init__(self):
+            self.num_att_layers = 0
+
+    if controller is None:
+        controller = DummyController()
+
+    def register_recr(net_, count, place_in_unet):
+        if net_.__class__.__name__ == 'CrossAttention':
+            net_.forward = ca_forward(net_, place_in_unet)
+            return count + 1
+        elif hasattr(net_, 'children'):
+            for net__ in net_.children():
+                count = register_recr(net__, count, place_in_unet)
+        return count
+
+    cross_att_count = 0
+    sub_nets = model.diffusion_model.named_children()
+
+    for net in sub_nets:
+        if "input_blocks" in net[0]:
+            cross_att_count += register_recr(net[1], 0, "down")
+        elif "output_blocks" in net[0]:
+            cross_att_count += register_recr(net[1], 0, "up")
+        elif "middle_block" in net[0]:
+            cross_att_count += register_recr(net[1], 0, "mid")
+
+    controller.num_att_layers = cross_att_count
+
+
+class AttentionControl(abc.ABC):
+    
+    def step_callback(self, x_t):
+        return x_t
+    
+    def between_steps(self):
+        return
+    
+    @property
+    def num_uncond_att_layers(self):
+        return 0
+    
+    @abc.abstractmethod
+    def forward (self, attn, is_cross: bool, place_in_unet: str):
+        raise NotImplementedError
+    
+    def __call__(self, attn, is_cross: bool, place_in_unet: str):
+        attn = self.forward(attn, is_cross, place_in_unet)
+        return attn
+    
+    def reset(self):
+        self.cur_step = 0
+        self.cur_att_layer = 0
+
+    def __init__(self):
+        self.cur_step = 0
+        self.num_att_layers = -1
+        self.cur_att_layer = 0
+
+
+class AttentionStore(AttentionControl):
+    @staticmethod
+    def get_empty_store():
+        return {"down_cross": [], "mid_cross": [], "up_cross": [],
+                "down_self": [],  "mid_self": [],  "up_self": []}
+
+    def forward(self, attn, is_cross: bool, place_in_unet: str):
+        key = f"{place_in_unet}_{'cross' if is_cross else 'self'}"
+        if attn.shape[1] <= (self.max_size) ** 2:  # avoid memory overhead
+            self.step_store[key].append(attn)
+        return attn
+
+    def between_steps(self):
+        if len(self.attention_store) == 0:
+            self.attention_store = self.step_store
+        else:
+            for key in self.attention_store:
+                for i in range(len(self.attention_store[key])):
+                    self.attention_store[key][i] += self.step_store[key][i]
+        self.step_store = self.get_empty_store()
+
+    def get_average_attention(self):
+        average_attention = {key: [item for item in self.step_store[key]] for key in self.step_store}
+        return average_attention
+
+    def reset(self):
+        super(AttentionStore, self).reset()
+        self.step_store = self.get_empty_store()
+        self.attention_store = {}
+
+    def __init__(self, base_size=64, max_size=None):
+        super(AttentionStore, self).__init__()
+        self.step_store = self.get_empty_store()
+        self.attention_store = {}
+        self.base_size = base_size
+        if max_size is None:
+            self.max_size = self.base_size // 2
+        else:
+            self.max_size = max_size
 
 def build_ldm_from_cfg(cfg_name) -> _LatentDiffusion:
 
@@ -240,23 +411,34 @@ class LdmExtractor(FeatureExtractor):
         encoder_block_indices: Tuple[int, ...] = (5, 7),
         unet_block_indices: Tuple[int, ...] = (2, 5, 8, 11),
         decoder_block_indices: Tuple[int, ...] = (2, 5),
-        steps: Tuple[int, ...] = (0,),
+        steps=(0,),
         share_noise: bool = True,
         enable_resize: bool = False,
+        init_checkpoint = "sd://v1-3",
+        decoder_only=False,
+        encoder_only=False,
+        resblock_only=False,
     ):
 
         super().__init__()
-
         self.encoder_block_indices = encoder_block_indices
         self.unet_block_indices = unet_block_indices
         self.decoder_block_indices = decoder_block_indices
+        self.decoder_only = decoder_only
+        self.encoder_only = encoder_only
+        self.resblock_only = resblock_only
 
         self.steps = steps
+        self.b1 = 1.2
+        self.b2 = 1.4
+        self.s1 = 0.9
+        self.s2 = 0.2
+        self.freeu = True
 
         if ldm is not None:
             self.ldm = ldm
         else:
-            self.ldm = LatentDiffusion()
+            self.ldm = LatentDiffusion(init_checkpoint=init_checkpoint)
         if enable_resize:
             self.image_preprocess = T.Resize(
                 size=self.ldm.image_size, interpolation=T.InterpolationMode.BICUBIC
@@ -314,12 +496,24 @@ class LdmExtractor(FeatureExtractor):
         for idx, block in enumerate(self.ldm.unet.output_blocks):
             if idx in self.unet_block_indices:
                 # The first block of TimestepEmbedSequential
-                unet_dims.append(block[0].channels)
+                if self.decoder_only: 
+                    if idx == 6 or idx == 9:
+                        unet_dims.append(block[0].channels-block[0].out_channels)
+                    else:
+                        unet_dims.append(block[0].out_channels)
+                elif self.encoder_only:
+                    if idx == 6 or idx == 9:
+                        unet_dims.append(block[0].out_channels)
+                    else:
+                        unet_dims.append(block[0].channels-block[0].out_channels)
+                elif self.resblock_only:
+                    unet_dims.append(block[0].out_channels)
+                else:
+                    unet_dims.append(block[0].channels)
 
                 group_size = 3
                 unet_strides.append(64 // (2 ** ((idx + group_size) // group_size - 1)))
                 unet_blocks.append(block)
-
         # Decoder
         all_decoder_blocks = []
         # decoder_blocks.extend(self.ldm.decoder.mid.block_1, self.ldm.decoder.mid.block_2)
@@ -478,16 +672,116 @@ class LdmExtractor(FeatureExtractor):
 
         # h = x.type(self.dtype)
         h = x
+        
+        if self.decoder_only:
+            for module in unet.input_blocks: # down sample
+                h = module(h, emb, context)
+                hs.append(h)
+            h = unet.middle_block(h, emb, context) # middle
+            for module in unet.output_blocks: # up sample
+                if module in self.unet_blocks:
+                    ret_features.append(h.contiguous())
+                h_out = hs.pop()
+                if self.freeu:
+                    # --------------- FreeU code -----------------------
+                    # Only operate on the first two stages
+                    if h.shape[1] == 1280:
+                        h[:,:640] = h[:,:640] * self.b1
+                        h_out = Fourier_filter(h_out, threshold=1, scale=self.s1)
+                    if h.shape[1] == 640:
+                        h[:,:320] = h[:,:320] * self.b2
+                        h_out = Fourier_filter(h_out, threshold=1, scale=self.s2)
+                    # ---------------------------------------------------------
+                h = torch.cat([h, h_out], dim=1)
+                h = module(h, emb, context)
+
+        elif self.encoder_only:
+            for module in unet.input_blocks:
+                h = module(h, emb, context)
+                hs.append(h)
+            h = unet.middle_block(h, emb, context)
+            for module in unet.output_blocks:
+                h_out = hs.pop()
+                if module in self.unet_blocks:
+                    ret_features.append(h_out.contiguous())
+                h = torch.cat([h, h_out], dim=1)
+                h = module(h, emb, context)
+
+        elif self.resblock_only:
+            for module in unet.input_blocks: # down sample
+                h = module(h, emb, context)
+                hs.append(h)
+            h = unet.middle_block(h, emb, context) # middle
+            for module in unet.output_blocks: # up sample
+                h = torch.cat([h, hs.pop()], dim=1)
+                if module in self.unet_blocks:
+                    with torch.no_grad():
+                        h_res = module[0](h, emb)-module[0].skip_connection(h)
+                    ret_features.append(h_res.contiguous())
+                h = module(h, emb, context)
+        else:
+            for module in unet.input_blocks: # down sample
+                h = module(h, emb, context)
+                hs.append(h)
+            h = unet.middle_block(h, emb, context) # middle
+            for module in unet.output_blocks: # up sample
+                h_out = hs.pop()
+                if self.freeu:
+                    # --------------- FreeU code -----------------------
+                    # Only operate on the first two stages
+                    if h.shape[1] == 1280:
+                        h[:,:640] = h[:,:640] * self.b1
+                        h_out = Fourier_filter(h_out, threshold=1, scale=self.s1)
+                    if h.shape[1] == 640:
+                        h[:,:320] = h[:,:320] * self.b2
+                        h_out = Fourier_filter(h_out, threshold=1, scale=self.s2)
+                    # ---------------------------------------------------------
+                h = torch.cat([h, h_out], dim=1)
+                if module in self.unet_blocks:
+                    ret_features.append(h.contiguous())
+                h = module(h, emb, context)
+        # h = h.type(x.dtype)
+        return unet.out(h), ret_features
+
+    def unet_forward_crossattn(self, x, timesteps, context, cond_emb=None):
+
+
+        unet = self.unet
+        attention_store = AttentionStore(base_size=512 // 8, max_size=None)
+        register_attention_control(unet, attention_store)
+        ret_features = []
+
+        hs = []
+        t_emb = timestep_embedding(timesteps, unet.model_channels, repeat_only=False)
+        emb = unet.time_embed(t_emb)
+        if cond_emb is not None:
+            emb += cond_emb
+
+        h = x
         for module in unet.input_blocks:
             h = module(h, emb, context)
             hs.append(h)
         h = unet.middle_block(h, emb, context)
+
+
+        attention_store.reset()
+
         for module in unet.output_blocks:
             h = torch.cat([h, hs.pop()], dim=1)
             if module in self.unet_blocks:
+
+                avg_attn = attention_store.get_average_attention()
+                attn16, attn32, attn64 = avg_attn
+                if attn16 is not None:
+                    h = torch.cat([h, attn16], dim=1)
+                elif attn32 is not None:
+                    h = torch.cat([h, attn32], dim=1)
+                elif attn64 is not None:
+                    h = torch.cat([h, attn64], dim=1)
+
                 ret_features.append(h.contiguous())
             h = module(h, emb, context)
-        # h = h.type(x.dtype)
+
         return unet.out(h), ret_features
 
     def decoder_forward(self, z):
@@ -559,13 +853,15 @@ class LdmExtractor(FeatureExtractor):
 
         if "caption" in batched_inputs:
             captions = batched_inputs["caption"]
+            # print(captions)
         else:
             captions = [""] * batch_size
 
         # latent_image = self.ldm.encode_to_latent(normalized_image)
         latent_image, encoder_features = self.encode_to_latent(normalized_image)
         cond_inputs = batched_inputs.get("cond_inputs", self.ldm.embed_text(captions))
-
+        if "caption" in batched_inputs:
+            cond_inputs = self.ldm.embed_text(captions)
         unet_features = []
         for i, t in enumerate(self.steps):
 
@@ -644,9 +940,8 @@ class LdmImplicitCaptionerExtractor(nn.Module):
         **kwargs,
     ):
         super().__init__()
-
         self.ldm_extractor = LdmExtractor(**kwargs)
-
+        num_timesteps=1
         self.text_embed_shape = self.ldm_extractor.ldm.embed_text([""]).shape[1:]
 
         self.clip = ClipAdapter(name=clip_model_name, normalize=False)
@@ -704,9 +999,12 @@ class LdmImplicitCaptionerExtractor(nn.Module):
 
         prefix = self.clip.embed_image(image).image_embed
         prefix_embed = self.clip_project(prefix)
-        batched_inputs["cond_inputs"] = (
-            self.ldm_extractor.ldm.uncond_inputs + torch.tanh(self.alpha_cond) * prefix_embed
-        )
+        
+        if "caption" not in batched_inputs or batched_inputs["caption"] is None:
+
+            batched_inputs["cond_inputs"] = (
+                self.ldm_extractor.ldm.uncond_inputs + torch.tanh(self.alpha_cond) * prefix_embed
+            )
 
         if self.learnable_time_embed:
             batched_inputs["cond_emb"] = torch.tanh(

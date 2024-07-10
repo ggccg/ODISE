@@ -54,7 +54,15 @@ class OpenPanopticInference(nn.Module):
     @property
     def num_classes(self):
         return len(self.labels)
+    
+    def get_features(self, batched_inputs, caption=None, pca=None):
+        assert not self.training
 
+        _open_state_dict = self.model.open_state_dict()
+        self.model.load_open_state_dict(self.open_state_dict)
+        results = self.model.get_features(batched_inputs, caption, pca=pca) if caption is not None else self.model.get_features(batched_inputs, pca=pca)
+        return results
+    
     def forward(self, batched_inputs):
         assert not self.training
 

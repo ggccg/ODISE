@@ -177,6 +177,7 @@ class CategoryODISE(ODISE):
         super().__init__(**kwargs)
         self.category_head = category_head
         self.clip_head = clip_head
+        # self.size_divisibility = 16
 
     def cal_pred_logits(self, outputs):
         # [B, Q, C]
@@ -205,7 +206,17 @@ class CategoryODISE(ODISE):
         pred = torch.cat([pred, null_pred], dim=-1)
 
         return pred
-
+    
+    def get_features(self, batched_inputs, caption=None, pca=None):
+        images = [x["image"].to(self.device) for x in batched_inputs]
+        images = [(x - self.pixel_mean) / self.pixel_std for x in images]
+        images = ImageList.from_tensors(images, self.size_divisibility)
+        if caption is not None:
+            features = self.backbone(images.tensor, caption, raw=pca)
+        else:
+            features = self.backbone(images.tensor, raw=pca)
+        return features
+    
     def forward(self, batched_inputs):
         """
         Args:

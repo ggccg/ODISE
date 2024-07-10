@@ -49,7 +49,6 @@ class FeatureExtractorBackbone(Backbone):
         super().__init__()
         self.feature_extractor = feature_extractor
         self.use_checkpoint = use_checkpoint
-
         self.feature_projections = nn.ModuleList()
         for feature_dim in self.feature_extractor.feature_dims:
             self.feature_projections.append(
@@ -64,7 +63,7 @@ class FeatureExtractorBackbone(Backbone):
                     )
                 )
             )
-
+        self.channel_scale = [dim/512 for dim in self.feature_extractor.feature_dims[2:6]]
         if isinstance(backbone_in_size, int):
             self.image_preprocess = T.Resize(
                 size=backbone_in_size, max_size=1280, interpolation=T.InterpolationMode.BICUBIC
@@ -101,13 +100,13 @@ class FeatureExtractorBackbone(Backbone):
         self._out_feature_channels = {}
         self._out_feature_strides = {}
 
-        for indices in self._sorted_grouped_indices:
+        for indices in self._sorted_grouped_indices: # some bugs here, cannot adjust layers of different stride
             stride = idx_to_stride[indices[0]]
             name = f"s{int(math.log2(stride))}"
             if name not in out_features:
                 continue
             assert name not in self._out_feature_strides, f"Duplicate feature name {name}"
-            self._out_feature_strides[name] = stride
+            self._out_feature_strides[name] = stride        # self._out_feature_strides need to be modified
             self._out_feature_channels[name] = projection_dim
         self._out_features = list(self._out_feature_strides.keys())
 
@@ -119,7 +118,7 @@ class FeatureExtractorBackbone(Backbone):
             f"max_stride: {max_stride}, \n"
             f"projection_dim: {projection_dim}, \n"
             f"out_feature_channels: {self._out_feature_channels}\n"
-            f"out_feature_strides: {self._out_feature_strides}\n"
+            f"out_feature_strides: {self._out_feature_strides}\n" 
             f"use_checkpoint: {use_checkpoint}\n"
         )
 
@@ -136,7 +135,7 @@ class FeatureExtractorBackbone(Backbone):
                 module.ignored_state_dict(destination, prefix + name + ".")
         return destination
 
-    def single_forward(self, img):
+    def single_forward(self, img, caption=None, raw=False):
 
         # save memory
         input_image_size = img.shape[-2:]
@@ -145,8 +144,17 @@ class FeatureExtractorBackbone(Backbone):
         # print("processed_image_size:", img.shape)
         img = ImageList.from_tensors(list(img), self.size_divisibility).tensor
         # print("padded size:", img.shape)
-        features = self.feature_extractor(dict(img=img))
-
+        if caption is not None:
+            features = self.feature_extractor(dict(img=img, caption=caption))
+        else:
+            features = self.feature_extractor(dict(img=img))
+        if raw:
+            out_features = {}
+            out_features['s5']=features[2]
+            out_features['s4']=features[3]
+            out_features['s3']=features[4]
+            out_features['s2']=features[5]
+            return out_features
         if self.use_checkpoint:
             return checkpoint.checkpoint(
                 self.forward_features, features, input_image_size, use_reentrant=False
@@ -178,14 +186,15 @@ class FeatureExtractorBackbone(Backbone):
 
         return output_features
 
-    def slide_forward(self, img):
-
+    def slide_forward(self, img, caption=None, raw=False):
+        scale = 2 if raw else 1
+        channel_scale = {'s5': self.channel_scale[0], 's4': self.channel_scale[1], 's3': self.channel_scale[2], 's2': self.channel_scale[3]} if raw else {'s5': 1, 's4': 1, 's3': 1, 's2': 1} #todo
         batch_size, _, h_img, w_img = img.shape
         # output_features = {k: torch.zeros_like(v) for k, v in self.single_forward(img).items()}
         output_features = {}
         for k in self._out_features:
-            stride = self._out_feature_strides[k]
-            channel = self._out_feature_channels[k]
+            stride = self._out_feature_strides[k] * scale
+            channel = int(self._out_feature_channels[k] * channel_scale[k])
             output_features[k] = torch.zeros(
                 (batch_size, channel, h_img // stride, w_img // stride),
                 dtype=img.dtype,
@@ -221,15 +230,15 @@ class FeatureExtractorBackbone(Backbone):
                 x2 = min(x1 + w_crop, w_img)
                 y1 = max(y2 - h_crop, 0)
                 x1 = max(x2 - w_crop, 0)
-                crop_img = img[:, :, y1:y2, x1:x2]
+                crop_img = img[:, :, y1:y2, x1:x2] #(1,3,512,512)
                 assert crop_img.shape[-2:] == (h_crop, w_crop), f"{crop_img.shape} from {img.shape}"
                 # print("crop_img.shape:", crop_img.shape)
-                crop_features = self.single_forward(crop_img)
+                crop_features = self.single_forward(crop_img,caption=caption,raw=raw)
                 for k in crop_features:
-                    k_x1 = x1 // self._out_feature_strides[k]
-                    k_x2 = x2 // self._out_feature_strides[k]
-                    k_y1 = y1 // self._out_feature_strides[k]
-                    k_y2 = y2 // self._out_feature_strides[k]
+                    k_x1 = x1 // (self._out_feature_strides[k] * scale)
+                    k_x2 = x2 // (self._out_feature_strides[k] * scale)
+                    k_y1 = y1 // (self._out_feature_strides[k] * scale)
+                    k_y2 = y2 // (self._out_feature_strides[k] * scale)
                     # output_features[k] += F.pad(
                     #     crop_features[k],
                     #     (
@@ -249,8 +258,8 @@ class FeatureExtractorBackbone(Backbone):
 
         return output_features
 
-    def forward(self, img):
+    def forward(self, img, caption=None, raw=False):
         if (self.training and not self._slide_training) or not self._slide_inference:
-            return self.single_forward(img)
+            return self.single_forward(img,caption,raw)
         else:
-            return self.slide_forward(img)
+            return self.slide_forward(img,caption,raw)

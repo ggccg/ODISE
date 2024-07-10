@@ -16,19 +16,19 @@ CVPR 2023 Highlight. (*equal contribution)
 
 For business inquiries, please visit our website and submit the form: [NVIDIA Research Licensing](https://www.nvidia.com/en-us/research/inquiries/).
 
-![teaser](figs/github_arch.gif)
+![teaser](./figs/github_arch.gif)
 
 ## Visual Results
 
 <div align="center">
-<img src="figs/github_vis_coco_0.gif" width="32%">
-<img src="figs/github_vis_ade_0.gif" width="32%">
-<img src="figs/github_vis_ego4d_0.gif" width="32%">
+<img src="./figs/github_vis_coco_0.gif" width="32%">
+<img src="./figs/github_vis_ade_0.gif" width="32%">
+<img src="./figs/github_vis_ego4d_0.gif" width="32%">
 </div>
 <div align="center">
-<img src="figs/github_vis_coco_1.gif" width="32%">
-<img src="figs/github_vis_ade_1.gif" width="32%">
-<img src="figs/github_vis_ego4d_1.gif" width="32%">
+<img src="./figs/github_vis_coco_1.gif" width="32%">
+<img src="./figs/github_vis_ade_1.gif" width="32%">
+<img src="./figs/github_vis_ego4d_1.gif" width="32%">
 </div>
 
 
@@ -149,9 +149,9 @@ When you run the `demo/demo.py` or inference script for the very first time, it 
 </table>
 
 ## Get Started
-See [Preparing Datasets for ODISE](datasets/README.md).
+See [Preparing Datasets for ODISE](./datasets/README.md).
 
-See [Getting Started with ODISE](GETTING_STARTED.md) for detailed instructions on training and inference with ODISE.
+See [Getting Started with ODISE](./GETTING_STARTED.md) for detailed instructions on training and inference with ODISE.
 ## Demo
 
 * Integrated into [Huggingface Spaces 🤗](https://huggingface.co/spaces) using [Gradio](https://github.com/gradio-app/gradio). Try out the web demo: [![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](https://huggingface.co/spaces/xvjiarui/ODISE)
