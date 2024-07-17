@@ -73,7 +73,7 @@ setup(
     python_requires=">=3.8",
     install_requires=[
         "timm==0.6.11",  # freeze timm version for stabliity
-        "opencv-python==4.6.0.66",
+        "opencv-python>=4.6.0.66",
         "diffdist==0.1",
         "nltk>=3.6.2",
         "einops>=0.3.0",
@@ -83,7 +83,7 @@ setup(
         # see: https://github.com/omry/omegaconf/issues/939
         "omegaconf==2.1.1",
         "open-clip-torch==2.0.2",
-        "stable-diffusion-sdkit==2.1.3",
+        "stable-diffusion-sdkit>=2.1.3",
     ],
     extras_require={
         # dev dependencies. Install them by `pip install 'odise[dev]'`
